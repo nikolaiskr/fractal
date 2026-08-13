@@ -727,3 +727,57 @@ kbd { font: 500 10px/1 system-ui; color: var(--secondary); background: var(--sur
 .calculator-surface.compact .calculator-grid button.wide { padding-left: 18px; }
 .calculator-surface.compact .calculator-grid { grid-template-rows: repeat(5, minmax(0, 1fr)); min-height: 0; }
 .calculator-surface.compact .calculator-grid button { aspect-ratio: auto; height: 100%; border-radius: 999px; }
+
+/* --- Fractal v0.4.1: shared snapshots, active pinned calculator, drafting snap --- */
+.save-status.shared { color: var(--accent); }
+.shared-view-pill {
+  position: absolute;
+  z-index: 34;
+  top: max(64px, calc(env(safe-area-inset-top) + 64px));
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  backdrop-filter: blur(14px);
+  box-shadow: var(--shadow);
+  color: var(--secondary);
+  pointer-events: none;
+  white-space: nowrap;
+}
+.shared-view-pill span { color: var(--accent); }
+.shared-view-pill strong { color: var(--text); font-size: 10px; font-weight: 600; }
+.shared-view-pill small { font-size: 9px; }
+
+.pinned-calculator-interactive {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.pinned-calculator-interactive .calculator-surface { width: 100%; }
+.pinned-calculator-title small {
+  margin-left: auto;
+  color: var(--secondary);
+  opacity: .58;
+  font-size: 8px;
+  font-weight: 500;
+}
+
+.measurement-draft.snapped .measurement-dot:last-of-type {
+  fill: var(--accent);
+  stroke: var(--accent);
+  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--accent) 62%, transparent));
+}
+.measurement-draft.snapped .measurement-main {
+  stroke: var(--accent);
+}
+
+@media (max-width: 720px) {
+  .shared-view-pill { top: max(58px, calc(env(safe-area-inset-top) + 58px)); }
+  .shared-view-pill small { display: none; }
+}
