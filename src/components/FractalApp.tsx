@@ -11,7 +11,7 @@ import {
   useRef,
   useState,
 } from 'react';
-import type { Bubble, Connection, DrawingPoint, ID, MeasureFragment, MeasureUnit, SpatialObject, Viewport } from '../domain/types';
+import type { Bubble, Connection, DrawingPoint, ID, MeasureFragment, MeasureUnit, PersistedState, SpatialObject, Viewport } from '../domain/types';
 import { fractalRepository } from '../data/indexedDbRepository';
 import { serializeStore, useFractalStore } from '../state/useFractalStore';
 import { clamp, getBounds } from '../utils/math';
@@ -41,13 +41,73 @@ const objectTitle = (object: SpatialObject) => {
 
 const canTransformObject = (object: SpatialObject) => object.type === 'text' || object.type === 'image' || object.type === 'link' || object.type === 'drawing' || object.type === 'calculator';
 
-const formatMeasurement = (lengthInCm: number, unit: MeasureUnit) => {
-  const value = unit === 'cm' ? lengthInCm : unit === 'm' ? lengthInCm / 100 : lengthInCm / 100000;
-  const digits = unit === 'cm' ? (value >= 100 ? 0 : 1) : unit === 'm' ? (value >= 10 ? 2 : 3) : 5;
+const formatMeasurement = (lengthInSelectedUnits: number, unit: MeasureUnit) => {
+  // One canvas unit equals one currently selected drafting unit.
+  // Switching cm → m → km changes the scale system, not the visual length of the line.
+  const value = lengthInSelectedUnits;
+  const digits = value >= 100 ? 0 : value >= 10 ? 1 : value >= 1 ? 2 : 3;
   return `${Number(value.toFixed(digits)).toLocaleString('ru-RU')} ${unit}`;
 };
 
 const ease = (t: number) => 1 - Math.pow(1 - t, 3);
+
+const SHARE_PARAM = 'share';
+
+const bytesToBase64Url = (bytes: Uint8Array) => {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(offset, Math.min(bytes.length, offset + chunk)));
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+};
+
+const base64UrlToBytes = (value: string) => {
+  const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = normalized + '='.repeat((4 - normalized.length % 4) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+};
+
+const encodeSharedSnapshot = (snapshot: PersistedState) => bytesToBase64Url(new TextEncoder().encode(JSON.stringify(snapshot)));
+const decodeSharedSnapshot = (payload: string) => JSON.parse(new TextDecoder().decode(base64UrlToBytes(payload))) as PersistedState;
+
+const buildSharedSnapshot = (state: ReturnType<typeof useFractalStore.getState>, rootSpaceId: ID): PersistedState => {
+  const includedSpaces = new Set<ID>();
+  const queue: ID[] = [rootSpaceId];
+  while (queue.length) {
+    const spaceId = queue.shift()!;
+    if (includedSpaces.has(spaceId) || !state.spaces[spaceId]) continue;
+    includedSpaces.add(spaceId);
+    for (const object of Object.values(state.objects)) {
+      if (object.spaceId !== spaceId) continue;
+      if (object.type === 'bubble' || object.type === 'portal') queue.push(object.targetSpaceId);
+    }
+  }
+
+  const spaces = Object.fromEntries(Object.entries(state.spaces)
+    .filter(([id]) => includedSpaces.has(id))
+    .map(([id, space]) => [id, id === rootSpaceId ? { ...space, parentSpaceId: undefined, parentBubbleId: undefined } : space]));
+  const objects = Object.fromEntries(Object.entries(state.objects).filter(([, object]) => includedSpaces.has(object.spaceId)));
+  const objectIds = new Set(Object.keys(objects));
+  const connections = Object.fromEntries(Object.entries(state.connections).filter(([, edge]) => includedSpaces.has(edge.spaceId) && objectIds.has(edge.sourceId) && objectIds.has(edge.targetId)));
+  const viewports = Object.fromEntries(Object.entries(state.viewports).filter(([id]) => includedSpaces.has(id)));
+
+  return {
+    version: 1,
+    homeSpaceId: rootSpaceId,
+    currentSpaceId: rootSpaceId,
+    spaces,
+    objects,
+    connections,
+    viewports,
+    timeline: [],
+    undo: [],
+    redo: [],
+  };
+};
 
 
 const textAutoSize = (content: string) => {
@@ -208,6 +268,8 @@ type MeasureState = {
   pointerId: number;
   start: { x: number; y: number };
   current: { x: number; y: number };
+  snappedStart?: boolean;
+  snappedEnd?: boolean;
 };
 
 export function FractalApp() {
@@ -264,6 +326,7 @@ export function FractalApp() {
   const [toast, setToast] = useState<string | null>(null);
   const [hoveredId, setHoveredId] = useState<ID | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; worldX: number; worldY: number; objectId?: ID; connectionId?: ID; measureUnits?: boolean } | null>(null);
+  const [readOnlyShare, setReadOnlyShare] = useState(() => new URLSearchParams(location.search).has(SHARE_PARAM));
   const reducedMotion = useReducedMotion();
 
   const currentSpace = spaces[currentSpaceId];
@@ -278,6 +341,27 @@ export function FractalApp() {
     return index;
   }, [objects]);
   const currentConnections = useMemo(() => Object.values(connections).filter((e) => e.spaceId === currentSpaceId), [connections, currentSpaceId]);
+  const measurementSnapPoints = useMemo(() => currentObjects.flatMap((object) => {
+    if (object.type !== 'measure') return [];
+    return [
+      { objectId: object.id, x: object.x + object.start.x, y: object.y + object.start.y },
+      { objectId: object.id, x: object.x + object.end.x, y: object.y + object.end.y },
+    ];
+  }), [currentObjects]);
+  const snapMeasurementPoint = useCallback((point: { x: number; y: number }, excludeObjectId?: ID) => {
+    const threshold = 14 / Math.max(viewportRef.current.zoom, .15);
+    let nearest = point;
+    let nearestDistance = threshold;
+    for (const candidate of measurementSnapPoints) {
+      if (candidate.objectId === excludeObjectId) continue;
+      const distance = Math.hypot(candidate.x - point.x, candidate.y - point.y);
+      if (distance <= nearestDistance) {
+        nearestDistance = distance;
+        nearest = { x: candidate.x, y: candidate.y };
+      }
+    }
+    return { point: nearest, snapped: nearest !== point, distance: nearestDistance };
+  }, [measurementSnapPoints]);
   const visibleObjects = useMemo(() => {
     const root = rootRef.current;
     if (!root) return currentObjects;
@@ -307,8 +391,8 @@ export function FractalApp() {
   const setViewport = useCallback((next: Viewport, persist = false) => {
     viewportRef.current = next;
     setViewportLocal(next);
-    if (persist) useFractalStore.getState().setViewport(useFractalStore.getState().currentSpaceId, next);
-  }, []);
+    if (persist && !readOnlyShare) useFractalStore.getState().setViewport(useFractalStore.getState().currentSpaceId, next);
+  }, [readOnlyShare]);
 
   const animateViewport = useCallback((target: Viewport, duration = 420, after?: () => void) => {
     if (cameraAnimation.current) cancelAnimationFrame(cameraAnimation.current);
@@ -330,12 +414,12 @@ export function FractalApp() {
       setViewport(next, false);
       if (t < 1) cameraAnimation.current = requestAnimationFrame(frame);
       else {
-        useFractalStore.getState().setViewport(useFractalStore.getState().currentSpaceId, target);
+        if (!readOnlyShare) useFractalStore.getState().setViewport(useFractalStore.getState().currentSpaceId, target);
         after?.();
       }
     };
     cameraAnimation.current = requestAnimationFrame(frame);
-  }, [reducedMotion, setViewport]);
+  }, [readOnlyShare, reducedMotion, setViewport]);
 
   const centerOnObject = useCallback((object: SpatialObject, zoom = Math.max(viewportRef.current.zoom, 1)) => {
     const rect = rootRef.current?.getBoundingClientRect();
@@ -417,8 +501,10 @@ export function FractalApp() {
   }, [animateViewport, enterSpace]);
 
   useEffect(() => {
-    fractalRepository.load().then((data) => {
+    const sharedPayload = new URLSearchParams(location.search).get(SHARE_PARAM);
+    const finishHydration = (data: PersistedState | null, shared: boolean) => {
       useFractalStore.getState().hydrateFrom(data);
+      setReadOnlyShare(shared);
       const idFromHash = new URLSearchParams(location.hash.replace(/^#/, '')).get('space');
       const state = useFractalStore.getState();
       const target = idFromHash && state.spaces[idFromHash] ? idFromHash : state.currentSpaceId;
@@ -426,12 +512,23 @@ export function FractalApp() {
       const view = state.viewports[target] ?? { x: innerWidth / 2, y: innerHeight / 2, zoom: 1 };
       viewportRef.current = view;
       setViewportLocal(view);
-      history.replaceState({ spaceId: target }, '', `#space=${encodeURIComponent(target)}`);
-    }).catch(() => useFractalStore.getState().hydrateFrom(null));
+      history.replaceState({ spaceId: target }, '', `${location.pathname}${location.search}#space=${encodeURIComponent(target)}`);
+    };
+
+    if (sharedPayload) {
+      try {
+        finishHydration(decodeSharedSnapshot(sharedPayload), true);
+      } catch {
+        setReadOnlyShare(false);
+        fractalRepository.load().then((data) => finishHydration(data, false)).catch(() => finishHydration(null, false));
+      }
+      return;
+    }
+    fractalRepository.load().then((data) => finishHydration(data, false)).catch(() => finishHydration(null, false));
   }, []);
 
   useEffect(() => {
-    if (!hydrated) return;
+    if (!hydrated || readOnlyShare) return;
     if (persistenceTimer.current) clearTimeout(persistenceTimer.current);
     persistenceTimer.current = window.setTimeout(async () => {
       const state = useFractalStore.getState();
@@ -446,7 +543,7 @@ export function FractalApp() {
     return () => {
       if (persistenceTimer.current) clearTimeout(persistenceTimer.current);
     };
-  }, [store.revision, hydrated]);
+  }, [store.revision, hydrated, readOnlyShare]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -534,12 +631,13 @@ export function FractalApp() {
     const rect = rootRef.current?.getBoundingClientRect();
     if (!rect) return false;
     const world = screenToWorld(clientX - rect.left, clientY - rect.top, viewportRef.current);
-    const next: MeasureState = { pointerId, start: world, current: world };
+    const snapped = snapMeasurementPoint(world);
+    const next: MeasureState = { pointerId, start: snapped.point, current: snapped.point, snappedStart: snapped.snapped, snappedEnd: snapped.snapped };
     measureRef.current = next;
     setDraftMeasure(next);
     useFractalStore.getState().clearSelection();
     return true;
-  }, []);
+  }, [snapMeasurementPoint]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -553,6 +651,7 @@ export function FractalApp() {
         return;
       }
       if (mod && event.key.toLowerCase() === 'z') {
+        if (readOnlyShare) return;
         event.preventDefault();
         if (event.shiftKey) useFractalStore.getState().redoAction();
         else useFractalStore.getState().undoAction();
@@ -563,6 +662,7 @@ export function FractalApp() {
         event.preventDefault();
         setSpaceHeld(true);
       }
+      if (readOnlyShare && event.key !== 'Escape') return;
       if (event.key === 'Escape') {
         setSearchOpen(false);
         setCreateMenuOpen(false);
@@ -602,7 +702,7 @@ export function FractalApp() {
       removeEventListener('keydown', onKeyDown);
       removeEventListener('keyup', onKeyUp);
     };
-  }, [createBubbleAtCenter, createFrameAtCenter, createTextAt, drawingMode, selectedIds, stopDrawingMode]);
+  }, [createBubbleAtCenter, createFrameAtCenter, createTextAt, drawingMode, readOnlyShare, selectedIds, stopDrawingMode]);
 
   const onWheel = (event: ReactWheelEvent) => {
     event.preventDefault();
@@ -611,7 +711,7 @@ export function FractalApp() {
 
     const objectNode = (event.target as Element).closest?.('[data-object-id]') as HTMLElement | null;
     const objectId = objectNode?.dataset.objectId;
-    if (objectId) {
+    if (objectId && !readOnlyShare) {
       const state = useFractalStore.getState();
       const object = state.objects[objectId];
       if (object && state.selectedIds.includes(objectId) && canTransformObject(object)) {
@@ -645,7 +745,7 @@ export function FractalApp() {
     if (looksLikeTrackpadPan && !event.altKey) {
       setViewport({ ...current, x: current.x - event.deltaX, y: current.y - event.deltaY }, false);
       window.clearTimeout(persistenceTimer.current);
-      persistenceTimer.current = window.setTimeout(() => useFractalStore.getState().setViewport(currentSpaceId, viewportRef.current), 160);
+      if (!readOnlyShare) persistenceTimer.current = window.setTimeout(() => useFractalStore.getState().setViewport(currentSpaceId, viewportRef.current), 160);
       return;
     }
     const px = event.clientX - rect.left;
@@ -713,7 +813,8 @@ export function FractalApp() {
     const activeMeasure = measureRef.current;
     if (activeMeasure && activeMeasure.pointerId === event.pointerId) {
       const world = screenToWorld(x, y, viewportRef.current);
-      const next = { ...activeMeasure, current: world };
+      const snapped = snapMeasurementPoint(world);
+      const next = { ...activeMeasure, current: snapped.point, snappedEnd: snapped.snapped };
       measureRef.current = next;
       setDraftMeasure(next);
       return;
@@ -762,8 +863,9 @@ export function FractalApp() {
     const activeMeasure = measureRef.current;
     if (activeMeasure && activeMeasure.pointerId === event.pointerId) {
       const rect = rootRef.current?.getBoundingClientRect();
-      const end = rect ? screenToWorld(event.clientX - rect.left, event.clientY - rect.top, viewportRef.current) : activeMeasure.current;
-      const finalMeasure = { ...activeMeasure, current: end };
+      const rawEnd = rect ? screenToWorld(event.clientX - rect.left, event.clientY - rect.top, viewportRef.current) : activeMeasure.current;
+      const snapped = snapMeasurementPoint(rawEnd);
+      const finalMeasure = { ...activeMeasure, current: snapped.point, snappedEnd: snapped.snapped };
       measureRef.current = null;
       setDraftMeasure(null);
       useFractalStore.getState().createMeasure(currentSpaceId, finalMeasure.start.x, finalMeasure.start.y, finalMeasure.current.x, finalMeasure.current.y, measureUnit);
@@ -809,6 +911,7 @@ export function FractalApp() {
 
   const onCanvasContextMenu = (event: ReactMouseEvent<HTMLDivElement>) => {
     event.preventDefault();
+    if (readOnlyShare) return;
     const rect = rootRef.current?.getBoundingClientRect();
     if (!rect) return;
     const objectNode = (event.target as HTMLElement).closest<HTMLElement>('[data-object-id]');
@@ -858,7 +961,7 @@ export function FractalApp() {
   };
 
   const onCanvasDoubleClick = (event: ReactMouseEvent<HTMLDivElement>) => {
-    if (drawingMode || measureMode) return;
+    if (readOnlyShare || drawingMode || measureMode) return;
     if ((event.target as HTMLElement).closest('[data-object-id]')) return;
     createTextAt(event.clientX, event.clientY);
   };
@@ -893,6 +996,11 @@ export function FractalApp() {
     if (event.button === 2) return;
     setContextMenu(null);
     if (editingId === object.id) return;
+    if (readOnlyShare) {
+      event.stopPropagation();
+      useFractalStore.getState().setSelection([object.id]);
+      return;
+    }
     if ((event.target as HTMLElement).closest('button, input, textarea, a, [data-resize-handle], [data-rotate-handle]')) return;
     if (measureMode && event.button === 0) {
       event.stopPropagation();
@@ -935,22 +1043,45 @@ export function FractalApp() {
     event.currentTarget.setPointerCapture(event.pointerId);
   };
 
+  const constrainDragDelta = useCallback((drag: DragState, dx: number, dy: number) => {
+    const ids = Object.keys(drag.initial);
+    if (ids.length !== 1) return { dx, dy };
+    const id = ids[0];
+    const object = useFractalStore.getState().objects[id];
+    const initial = drag.initial[id];
+    if (!object || object.type !== 'measure' || !initial) return { dx, dy };
+
+    const candidates = [object.start, object.end].map((endpoint) => {
+      const currentPoint = { x: initial.x + dx + endpoint.x, y: initial.y + dy + endpoint.y };
+      const snapped = snapMeasurementPoint(currentPoint, object.id);
+      return { ...snapped, currentPoint };
+    }).filter((candidate) => candidate.snapped);
+    if (!candidates.length) return { dx, dy };
+    candidates.sort((a, b) => a.distance - b.distance);
+    const best = candidates[0];
+    return { dx: dx + (best.point.x - best.currentPoint.x), dy: dy + (best.point.y - best.currentPoint.y) };
+  }, [snapMeasurementPoint]);
+
   const onObjectPointerMove = (event: ReactPointerEvent<HTMLElement>) => {
     const drag = dragRef.current;
     if (!drag || drag.pointerId !== event.pointerId) return;
-    const dx = (event.clientX - drag.startX) / viewportRef.current.zoom;
-    const dy = (event.clientY - drag.startY) / viewportRef.current.zoom;
-    if (Math.hypot(dx, dy) < 0.25) return;
-    drag.targetDx = dx;
-    drag.targetDy = dy;
+    const rawDx = (event.clientX - drag.startX) / viewportRef.current.zoom;
+    const rawDy = (event.clientY - drag.startY) / viewportRef.current.zoom;
+    if (Math.hypot(rawDx, rawDy) < 0.25) return;
+    const constrained = constrainDragDelta(drag, rawDx, rawDy);
+    drag.targetDx = constrained.dx;
+    drag.targetDy = constrained.dy;
     queueDragFrame();
   };
 
   const onObjectPointerUp = (event: ReactPointerEvent<HTMLElement>) => {
     const drag = dragRef.current;
     if (!drag || drag.pointerId !== event.pointerId) return;
-    drag.targetDx = (event.clientX - drag.startX) / viewportRef.current.zoom;
-    drag.targetDy = (event.clientY - drag.startY) / viewportRef.current.zoom;
+    const rawDx = (event.clientX - drag.startX) / viewportRef.current.zoom;
+    const rawDy = (event.clientY - drag.startY) / viewportRef.current.zoom;
+    const constrained = constrainDragDelta(drag, rawDx, rawDy);
+    drag.targetDx = constrained.dx;
+    drag.targetDy = constrained.dy;
     drag.released = true;
     queueDragFrame();
   };
@@ -997,6 +1128,7 @@ export function FractalApp() {
   };
 
   const handlePaste = useCallback((event: ClipboardEvent) => {
+    if (readOnlyShare) return;
     if ((event.target as HTMLElement)?.matches?.('textarea,input,[contenteditable="true"]')) return;
     const rect = rootRef.current?.getBoundingClientRect();
     if (!rect) return;
@@ -1016,7 +1148,7 @@ export function FractalApp() {
     event.preventDefault();
     if (/^https?:\/\//i.test(text)) useFractalStore.getState().createLink(currentSpaceId, center.x - 150, center.y - 64, text);
     else { const size = textAutoSize(text); useFractalStore.getState().createText(currentSpaceId, center.x - size.width / 2, center.y - size.height / 2, text); }
-  }, [currentSpaceId]);
+  }, [currentSpaceId, readOnlyShare]);
 
   useEffect(() => {
     document.addEventListener('paste', handlePaste);
@@ -1025,6 +1157,7 @@ export function FractalApp() {
 
   const onDrop = (event: ReactDragEvent<HTMLDivElement>) => {
     event.preventDefault();
+    if (readOnlyShare) return;
     const rect = rootRef.current?.getBoundingClientRect();
     if (!rect) return;
     const world = screenToWorld(event.clientX - rect.left, event.clientY - rect.top, viewportRef.current);
@@ -1089,6 +1222,28 @@ export function FractalApp() {
     useFractalStore.getState().createLink(currentSpaceId, p.x - 150, p.y - 64, url);
   };
 
+  const shareCurrentSpace = async () => {
+    const state = useFractalStore.getState();
+    const snapshot = buildSharedSnapshot(state, currentSpaceId);
+    const payload = encodeSharedSnapshot(snapshot);
+    const url = new URL(location.href);
+    url.search = '';
+    url.searchParams.set(SHARE_PARAM, payload);
+    url.hash = `space=${encodeURIComponent(currentSpaceId)}`;
+    if (url.toString().length > 1_500_000) {
+      setToast('This Space is too large for a view link. Large embedded images are usually the reason.');
+      window.setTimeout(() => setToast(null), 3200);
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(url.toString());
+      setToast('View-only snapshot link copied');
+    } catch {
+      prompt('Copy this view-only snapshot link', url.toString());
+    }
+    window.setTimeout(() => setToast(null), 2200);
+  };
+
   const goHome = () => {
     if (currentSpaceId === homeSpaceId) {
       const next = { x: innerWidth / 2, y: innerHeight / 2, zoom: 0.78 };
@@ -1104,6 +1259,7 @@ export function FractalApp() {
       openBubble(object as Bubble);
       return;
     }
+    if (readOnlyShare) return;
     if (object.type === 'text') {
       editingBefore.current = useFractalStore.getState().makeSnapshot();
       setEditingId(object.id);
@@ -1178,7 +1334,7 @@ export function FractalApp() {
         <article {...common}>
           <div className="portal-mark">◎</div>
           <div className="portal-copy"><small>PORTAL</small><strong>{object.title}</strong><span>{spaces[object.targetSpaceId]?.title ?? 'Space'}</span></div>
-          {selected && <ResizeHandle object={object} onDown={onResizePointerDown} onMove={onResizePointerMove} onUp={onResizePointerUp} />}
+          {selected && !readOnlyShare && <ResizeHandle object={object} onDown={onResizePointerDown} onMove={onResizePointerMove} onUp={onResizePointerUp} />}
         </article>
       );
     }
@@ -1187,7 +1343,7 @@ export function FractalApp() {
       return (
         <section {...common}>
           <span className="frame-title">{object.title}</span>
-          {selected && <ResizeHandle object={object} onDown={onResizePointerDown} onMove={onResizePointerMove} onUp={onResizePointerUp} />}
+          {selected && !readOnlyShare && <ResizeHandle object={object} onDown={onResizePointerDown} onMove={onResizePointerMove} onUp={onResizePointerUp} />}
         </section>
       );
     }
@@ -1195,7 +1351,7 @@ export function FractalApp() {
     if (object.type === 'calculator') {
       return <article {...common} className={`${common.className} calculator-widget`}>
         <PinnedCalculator />
-        {selected && <FragmentTransformHandles object={object} onResizeDown={onResizePointerDown} onResizeMove={onResizePointerMove} onResizeUp={onResizePointerUp} onRotate={() => useFractalStore.getState().rotateObject(object.id, 90)} />}
+        {selected && !readOnlyShare && <FragmentTransformHandles object={object} onResizeDown={onResizePointerDown} onResizeMove={onResizePointerMove} onResizeUp={onResizePointerUp} onRotate={() => useFractalStore.getState().rotateObject(object.id, 90)} />}
       </article>;
     }
 
@@ -1226,7 +1382,7 @@ export function FractalApp() {
               {object.content ? object.content.split('\n').map((line, index) => renderTextLine(line, index)) : <span className="placeholder">Start typing…</span>}
             </div>
           )}
-          {selected && <FragmentTransformHandles object={object} onResizeDown={onResizePointerDown} onResizeMove={onResizePointerMove} onResizeUp={onResizePointerUp} onRotate={() => useFractalStore.getState().rotateObject(object.id, 90)} />}
+          {selected && !readOnlyShare && <FragmentTransformHandles object={object} onResizeDown={onResizePointerDown} onResizeMove={onResizePointerMove} onResizeUp={onResizePointerUp} onRotate={() => useFractalStore.getState().rotateObject(object.id, 90)} />}
         </article>
       );
     }
@@ -1238,7 +1394,7 @@ export function FractalApp() {
             <path d={pathFromStrokes(object.strokes?.length ? object.strokes : [object.points])} style={{ strokeWidth: object.strokeWidth }} />
           </svg>
           {object.label && <figcaption className="drawing-caption">{object.label}</figcaption>}
-          {selected && <FragmentTransformHandles object={object} onResizeDown={onResizePointerDown} onResizeMove={onResizePointerMove} onResizeUp={onResizePointerUp} onRotate={() => useFractalStore.getState().rotateObject(object.id, 90)} />}
+          {selected && !readOnlyShare && <FragmentTransformHandles object={object} onResizeDown={onResizePointerDown} onResizeMove={onResizePointerMove} onResizeUp={onResizePointerUp} onRotate={() => useFractalStore.getState().rotateObject(object.id, 90)} />}
         </figure>
       );
     }
@@ -1248,7 +1404,7 @@ export function FractalApp() {
         <figure {...common}>
           <img src={object.src} alt={object.alt ?? ''} draggable={false} />
           {object.alt && <figcaption className="image-caption">{object.alt}</figcaption>}
-          {selected && <FragmentTransformHandles object={object} onResizeDown={onResizePointerDown} onResizeMove={onResizePointerMove} onResizeUp={onResizePointerUp} onRotate={() => useFractalStore.getState().rotateObject(object.id, 90)} />}
+          {selected && !readOnlyShare && <FragmentTransformHandles object={object} onResizeDown={onResizePointerDown} onResizeMove={onResizePointerMove} onResizeUp={onResizePointerUp} onRotate={() => useFractalStore.getState().rotateObject(object.id, 90)} />}
         </figure>
       );
     }
@@ -1259,7 +1415,7 @@ export function FractalApp() {
           <div className="link-icon"><img src={`https://www.google.com/s2/favicons?domain=${encodeURIComponent(object.domain)}&sz=64`} alt="" /></div>
           <div className="link-copy"><strong>{object.title}</strong><span>{object.domain}</span><small>{object.url}</small></div>
         </a>
-        {selected && canTransformObject(object) && <FragmentTransformHandles object={object} onResizeDown={onResizePointerDown} onResizeMove={onResizePointerMove} onResizeUp={onResizePointerUp} onRotate={() => useFractalStore.getState().rotateObject(object.id, 90)} />}
+        {selected && !readOnlyShare && canTransformObject(object) && <FragmentTransformHandles object={object} onResizeDown={onResizePointerDown} onResizeMove={onResizePointerMove} onResizeUp={onResizePointerUp} onRotate={() => useFractalStore.getState().rotateObject(object.id, 90)} />}
       </article>
     );
   };
@@ -1278,13 +1434,17 @@ export function FractalApp() {
           {breadcrumb.map((item, index) => <span key={item.id}><button onClick={() => enterSpace(item.id, true)}>{item.title}</button>{index < breadcrumb.length - 1 && <i>/</i>}</span>)}
         </nav>
         <div className="top-actions">
-          <span className={`save-status ${saveStatus}`}>{saveStatus === 'saving' ? 'Saving…' : saveStatus === 'error' ? 'Save error' : 'Saved'}</span>
+          <span className={`save-status ${readOnlyShare ? 'shared' : saveStatus}`}>{readOnlyShare ? 'View only' : saveStatus === 'saving' ? 'Saving…' : saveStatus === 'error' ? 'Save error' : 'Saved'}</span>
           <button className="icon-button" onClick={() => setSearchOpen(true)} aria-label="Search">⌕</button>
+          {!readOnlyShare && <button className="icon-button" onClick={shareCurrentSpace} aria-label="Share Space" title="Copy view-only snapshot link">↗</button>}
+          {readOnlyShare && <button className="icon-button" onClick={() => { location.href = location.pathname; }} aria-label="Open my Fractal" title="Open my Fractal">◉</button>}
           <button className="icon-button" onClick={() => useFractalStore.getState().setTheme(theme === 'light' ? 'dark' : 'light')} aria-label="Toggle theme">{theme === 'light' ? '◐' : '◑'}</button>
         </div>
       </header>
 
-      <div className="global-tools-anchor">
+      {readOnlyShare && <div className="shared-view-pill"><span>↗</span><strong>Shared snapshot</strong><small>View only · changes are not live</small></div>}
+
+      {!readOnlyShare && <div className="global-tools-anchor">
         <button className={`icon-button global-tools-button ${toolsOpen ? 'active' : ''}`} onClick={() => setToolsOpen((value) => !value)} aria-label="Additional tools" title="Additional tools">⊞</button>
         {toolsOpen && <div className="global-tools-menu" onPointerDown={(e) => e.stopPropagation()}>
           <button onClick={() => { setCalculatorOpen(true); setToolsOpen(false); }}><span className="tool-menu-icon">⌗</span><span><strong>Calculator</strong><small>Basic calculations, always available</small></span></button>
@@ -1297,9 +1457,9 @@ export function FractalApp() {
             setToolsOpen(false);
           }}><span className="tool-menu-icon">⌁</span><span><strong>Light drafting</strong><small>{measureMode ? `Active · ${measureUnit}` : 'Dimension lines · cm / m / km'}</small></span></button>
         </div>}
-      </div>
+      </div>}
 
-      {calculatorOpen && <CalculatorPanel onClose={() => setCalculatorOpen(false)} onPinCalculator={() => {
+      {!readOnlyShare && calculatorOpen && <CalculatorPanel onClose={() => setCalculatorOpen(false)} onPinCalculator={() => {
         const rect = rootRef.current?.getBoundingClientRect();
         if (!rect) return;
         const p = screenToWorld(rect.width / 2, rect.height / 2, viewportRef.current);
@@ -1310,8 +1470,7 @@ export function FractalApp() {
         const rect = rootRef.current?.getBoundingClientRect();
         if (!rect) return;
         const p = screenToWorld(rect.width / 2, rect.height / 2, viewportRef.current);
-        useFractalStore.getState().createText(currentSpaceId, p.x - 90, p.y - 40, `Calculator
-${value}`);
+        useFractalStore.getState().createText(currentSpaceId, p.x - 90, p.y - 40, value);
         setToast('Result pinned to this Space');
         window.setTimeout(() => setToast(null), 1800);
       }} />}
@@ -1341,6 +1500,7 @@ ${value}`);
             zoom={viewport.zoom}
             onSelect={(id) => useFractalStore.getState().selectConnection(id)}
             onContextMenu={(id, x, y) => {
+              if (readOnlyShare) return;
               const rect = rootRef.current?.getBoundingClientRect();
               if (!rect) return;
               useFractalStore.getState().selectConnection(id);
@@ -1354,7 +1514,7 @@ ${value}`);
             }}
           />
           {draftDrawing.some((stroke) => stroke.length > 1) && <svg className="drawing-draft" overflow="visible"><path d={pathFromStrokes(draftDrawing)} /></svg>}
-          {draftMeasure && <MeasurementDraft start={draftMeasure.start} end={draftMeasure.current} unit={measureUnit} />}
+          {draftMeasure && <MeasurementDraft start={draftMeasure.start} end={draftMeasure.current} unit={measureUnit} snapped={Boolean(draftMeasure.snappedEnd)} />}
           {visibleObjects
             .filter((object) => !(viewport.zoom < VERY_FAR_ZOOM && object.type !== 'bubble' && object.type !== 'portal'))
             .sort((a, b) => (a.type === 'frame' ? -1 : 0) - (b.type === 'frame' ? -1 : 0))
@@ -1369,7 +1529,7 @@ ${value}`);
             <h1>FRACTAL</h1>
             <p>Double-click anywhere<br />to create your first thought.</p>
             <div className="empty-hints"><span>Double-click <b>→ create</b></span><span>Drag <b>→ move</b></span><span>Scroll <b>→ explore</b></span></div>
-            <button onClick={() => useFractalStore.getState().loadDemo()}>Explore demo universe</button>
+            {!readOnlyShare && <button onClick={() => useFractalStore.getState().loadDemo()}>Explore demo universe</button>}
           </div>
         )}
       </div>
@@ -1497,7 +1657,7 @@ function MeasurementObject({ object, ...props }: { object: MeasureFragment } & H
   </figure>;
 }
 
-function MeasurementDraft({ start, end, unit }: { start: { x: number; y: number }; end: { x: number; y: number }; unit: MeasureUnit }) {
+function MeasurementDraft({ start, end, unit, snapped = false }: { start: { x: number; y: number }; end: { x: number; y: number }; unit: MeasureUnit; snapped?: boolean }) {
   const pad = 34;
   const minX = Math.min(start.x, end.x) - pad;
   const minY = Math.min(start.y, end.y) - pad;
@@ -1505,7 +1665,7 @@ function MeasurementDraft({ start, end, unit }: { start: { x: number; y: number 
   const maxY = Math.max(start.y, end.y) + pad;
   const width = Math.max(68, maxX - minX);
   const height = Math.max(68, maxY - minY);
-  return <div className="measurement-draft" style={{ left: minX, top: minY, width, height }}>
+  return <div className={`measurement-draft ${snapped ? 'snapped' : ''}`} style={{ left: minX, top: minY, width, height }}>
     <MeasurementGraphic start={{ x: start.x - minX, y: start.y - minY }} end={{ x: end.x - minX, y: end.y - minY }} width={width} height={height} unit={unit} draft />
   </div>;
 }
@@ -1611,8 +1771,10 @@ function CalculatorPanel({ onClose, onPinCalculator, onPinResult }: { onClose: (
 
 function PinnedCalculator() {
   return <div className="pinned-calculator">
-    <div className="pinned-calculator-title"><span>⌗</span><strong>Calculator</strong></div>
-    <CalculatorSurface compact />
+    <div className="pinned-calculator-title"><span>⌗</span><strong>Calculator</strong><small>drag here</small></div>
+    <div className="pinned-calculator-interactive" onPointerDown={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()} onWheel={(event) => event.stopPropagation()}>
+      <CalculatorSurface compact />
+    </div>
   </div>;
 }
 
